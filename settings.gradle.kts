@@ -14,3 +14,4 @@ dependencyResolutionManagement {
 }
 rootProject.name = "SolarWatch"
 include(":app")
+include(":mobile")

@@ -19,6 +19,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -35,9 +36,12 @@ import androidx.compose.ui.text.TextMeasurer
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.wear.compose.material.Text
+import ch.solarwatch.data.ChartMode
+import ch.solarwatch.data.ChartSeries
 import ch.solarwatch.data.History
 import ch.solarwatch.data.formatPower
 import java.text.SimpleDateFormat
@@ -52,100 +56,58 @@ val InkPrimary = Color(0xFFEEEEEE)
 val InkMuted = Color(0xFF9E9E9E)
 private val GridColor = Color(0xFF2E2E2E)
 
+private data class ChartLine(
+    val series: ChartSeries,
+    val points: List<Pair<Long, Double>>,
+) {
+    val color get() = Color(series.color)
+    val isTemp get() = series.isTemperature
+}
+
 /**
- * 24-h-Diagramm mit PV, Verbrauch (linke Skala, kW) und Wassertemperatur
- * (rechte Skala, °C). Die Temperatur hat bewusst eine eigene Skala –
- * Schnittpunkte mit den Leistungslinien haben keine Bedeutung.
+ * Verlauf der gewählten Kurven.
+ *  - [ChartMode.COMBINED]: ein Diagramm, Leistung links (kW), Temperatur rechts (°C).
+ *    Die Temperatur hat bewusst eine eigene Skala – Schnittpunkte haben keine Bedeutung.
+ *  - [ChartMode.SEPARATE]: ein Diagramm pro Kurve, untereinander, gleiche Zeitachse.
  *
- * Kopfzeile: Legende; beim Antippen/Wischen die Werte zum gewählten Zeitpunkt.
+ * Antippen/Wischen zeigt die Werte zum gewählten Zeitpunkt (in allen Diagrammen gleichzeitig).
  */
 @Composable
-fun CombinedChart(h: History, modifier: Modifier = Modifier) {
-    val pv = h.pvW.points
-    val cons = h.consumptionW.points
-    val water = h.waterTempC?.points.orEmpty()
+fun HistoryCharts(
+    h: History,
+    series: List<ChartSeries>,
+    mode: ChartMode,
+    modifier: Modifier = Modifier,
+) {
+    val lines = series.mapNotNull { s ->
+        val pts = when (s) {
+            ChartSeries.PV -> h.pvW.points
+            ChartSeries.CONSUMPTION -> h.consumptionW.points
+            ChartSeries.WATER -> h.waterTempC?.points ?: return@mapNotNull null // keine Wärmepumpe
+        }
+        ChartLine(s, pts)
+    }
+    if (lines.isEmpty()) return
 
-    // Leistung: 0 .. runder Maximalwert
-    val pMax = niceCeil((pv + cons).maxOfOrNull { it.second } ?: 1000.0)
-    // Temperatur: eng um die Daten, auf 5 °C gerundet
-    val tMin = water.minOfOrNull { it.second }?.let { floor(it / 5) * 5 } ?: 0.0
-    val tMax = water.maxOfOrNull { it.second }?.let { (ceil(it / 5) * 5).coerceAtLeast(tMin + 5) } ?: 1.0
-
-    var scrubX by remember { mutableStateOf<Float?>(null) }
-    var widthPx by remember { mutableStateOf(1f) }
-    val textMeasurer = rememberTextMeasurer()
-    val timeFmt = remember { SimpleDateFormat("HH:mm", Locale.GERMANY) }
-
-    val scrubT = scrubX?.let { x -> h.fromMillis + ((x / widthPx).coerceIn(0f, 1f) * (h.toMillis - h.fromMillis)).toLong() }
-    fun nearest(s: List<Pair<Long, Double>>) = scrubT?.let { t -> s.minByOrNull { abs(it.first - t) } }
-    val sPv = nearest(pv)
-    val sCons = nearest(cons)
-    val sWater = nearest(water)
+    // Gewählter Zeitpunkt als Anteil 0..1 der Breite, gemeinsam für alle Diagramme
+    var scrub by remember { mutableStateOf<Float?>(null) }
+    val separate = mode == ChartMode.SEPARATE && lines.size > 1
 
     Column(modifier, horizontalAlignment = Alignment.CenterHorizontally) {
-        // Kopfzeile mit fester Höhe, damit nichts springt
-        Row(
-            modifier = Modifier.height(16.dp),
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            if (scrubT != null) {
-                Text(timeFmt.format(Date(sPv?.first ?: scrubT)), fontSize = 11.sp, color = InkMuted)
-                LegendItem(SolarYellow, sPv?.let { formatPower(it.second) } ?: "–")
-                LegendItem(HouseBlue, sCons?.let { formatPower(it.second) } ?: "–")
-                if (water.isNotEmpty()) LegendItem(HeatOrange, sWater?.let { "%.0f°".format(it.second) } ?: "–")
-            } else {
-                LegendItem(SolarYellow, "PV")
-                LegendItem(HouseBlue, "Verbr.")
-                if (water.isNotEmpty()) LegendItem(HeatOrange, "Wasser")
+        if (separate) {
+            lines.forEach { line ->
+                ChartPanel(
+                    lines = listOf(line),
+                    h = h,
+                    scrub = scrub,
+                    onScrub = { scrub = it },
+                    headerHeight = 13.dp,
+                    headerFont = 10.sp,
+                    modifier = Modifier.weight(1f).padding(bottom = 2.dp),
+                )
             }
-        }
-
-        Canvas(
-            modifier = Modifier
-                .fillMaxWidth()
-                .weight(1f)
-                .pointerInput(Unit) {
-                    detectTapGestures(onTap = { scrubX = if (scrubX == null) it.x else null })
-                }
-                .pointerInput(Unit) {
-                    detectHorizontalDragGestures(onDragStart = { scrubX = it.x }) { change, _ ->
-                        scrubX = change.position.x
-                    }
-                },
-        ) {
-            widthPx = size.width
-            fun x(t: Long) = ((t - h.fromMillis).toFloat() / (h.toMillis - h.fromMillis)) * size.width
-            fun yP(v: Double) = size.height - (v / pMax).toFloat() * size.height
-            fun yT(v: Double) = size.height - ((v - tMin) / (tMax - tMin)).toFloat() * size.height
-
-            // Raster
-            listOf(0f, 0.5f, 1f).forEach { f ->
-                val y = size.height * f
-                drawLine(GridColor, Offset(0f, y), Offset(size.width, y), strokeWidth = 1f)
-            }
-
-            val stroke = Stroke(2.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round)
-            drawSeries(pv, ::x, ::yP, SolarYellow, stroke)
-            drawSeries(cons, ::x, ::yP, HouseBlue, stroke)
-            drawSeries(water, ::x, ::yT, HeatOrange, stroke)
-
-            // Skalen: links Leistung, rechts Temperatur (nach den Linien, mit Hintergrund)
-            val style = TextStyle(fontSize = 9.sp, color = InkMuted)
-            label(textMeasurer, formatPower(pMax), style, left = true, y = 0f)
-            if (water.isNotEmpty()) {
-                label(textMeasurer, "%.0f°".format(tMax), style, left = false, y = 0f)
-                label(textMeasurer, "%.0f°".format(tMin), style, left = false, y = size.height, bottom = true)
-            }
-
-            // Fadenkreuz
-            scrubT?.let {
-                val cx = x(sPv?.first ?: it)
-                drawLine(InkMuted, Offset(cx, 0f), Offset(cx, size.height), strokeWidth = 1.dp.toPx())
-                sPv?.let { p -> dot(Offset(x(p.first), yP(p.second)), SolarYellow) }
-                sCons?.let { p -> dot(Offset(x(p.first), yP(p.second)), HouseBlue) }
-                sWater?.let { p -> dot(Offset(x(p.first), yT(p.second)), HeatOrange) }
-            }
+        } else {
+            ChartPanel(lines, h, scrub, { scrub = it }, 16.dp, 11.sp, Modifier.weight(1f))
         }
 
         // Zeitachse etwas eingerückt, damit der runde Rand nichts abschneidet
@@ -162,11 +124,108 @@ fun CombinedChart(h: History, modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun LegendItem(color: Color, text: String) {
+private fun ChartPanel(
+    lines: List<ChartLine>,
+    h: History,
+    scrub: Float?,
+    onScrub: (Float?) -> Unit,
+    headerHeight: androidx.compose.ui.unit.Dp,
+    headerFont: TextUnit,
+    modifier: Modifier,
+) {
+    val power = lines.filter { !it.isTemp }
+    val temps = lines.filter { it.isTemp }
+
+    // Leistung: 0 .. runder Maximalwert
+    val pMax = niceCeil(power.flatMap { it.points }.maxOfOrNull { it.second } ?: 1000.0)
+    // Temperatur: eng um die Daten, auf 5 °C gerundet
+    val allT = temps.flatMap { it.points }
+    val tMin = allT.minOfOrNull { it.second }?.let { floor(it / 5) * 5 } ?: 0.0
+    val tMax = allT.maxOfOrNull { it.second }?.let { (ceil(it / 5) * 5).coerceAtLeast(tMin + 5) } ?: 1.0
+
+    var widthPx by remember { mutableStateOf(1f) }
+    // Gesten-Handler laufen in pointerInput(Unit) weiter -> immer aktuellen Wert lesen
+    val currentScrub by rememberUpdatedState(scrub)
+    val currentOnScrub by rememberUpdatedState(onScrub)
+    val textMeasurer = rememberTextMeasurer()
+    val timeFmt = remember { SimpleDateFormat("HH:mm", Locale.GERMANY) }
+
+    val scrubT = scrub?.let { f -> h.fromMillis + (f * (h.toMillis - h.fromMillis)).toLong() }
+    val nearest = lines.map { l -> scrubT?.let { t -> l.points.minByOrNull { abs(it.first - t) } } }
+
+    Column(modifier, horizontalAlignment = Alignment.CenterHorizontally) {
+        // Kopfzeile mit fester Höhe, damit nichts springt
+        Row(
+            modifier = Modifier.height(headerHeight),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            if (scrubT != null) {
+                val t = nearest.firstNotNullOfOrNull { it }?.first ?: scrubT
+                Text(timeFmt.format(Date(t)), fontSize = headerFont, color = InkMuted)
+                lines.forEachIndexed { i, l ->
+                    LegendItem(l.color, nearest[i]?.let { valueText(l, it.second) } ?: "–", headerFont)
+                }
+            } else {
+                lines.forEach { LegendItem(it.color, it.series.label, headerFont) }
+            }
+        }
+
+        Canvas(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f)
+                .pointerInput(Unit) {
+                    detectTapGestures(onTap = { currentOnScrub(if (currentScrub == null) it.x / widthPx else null) })
+                }
+                .pointerInput(Unit) {
+                    detectHorizontalDragGestures(onDragStart = { currentOnScrub(it.x / widthPx) }) { change, _ ->
+                        currentOnScrub((change.position.x / widthPx).coerceIn(0f, 1f))
+                    }
+                },
+        ) {
+            widthPx = size.width
+            fun x(t: Long) = ((t - h.fromMillis).toFloat() / (h.toMillis - h.fromMillis)) * size.width
+            fun yP(v: Double) = size.height - (v / pMax).toFloat() * size.height
+            fun yT(v: Double) = size.height - ((v - tMin) / (tMax - tMin)).toFloat() * size.height
+
+            // Raster
+            listOf(0f, 0.5f, 1f).forEach { f ->
+                val y = size.height * f
+                drawLine(GridColor, Offset(0f, y), Offset(size.width, y), strokeWidth = 1f)
+            }
+
+            val stroke = Stroke(2.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round)
+            lines.forEach { l -> drawSeries(l.points, ::x, if (l.isTemp) ::yT else ::yP, l.color, stroke) }
+
+            // Skalen: links Leistung, rechts Temperatur (nach den Linien, mit Hintergrund)
+            val style = TextStyle(fontSize = 9.sp, color = InkMuted)
+            if (power.isNotEmpty()) label(textMeasurer, formatPower(pMax), style, left = true, y = 0f)
+            if (allT.isNotEmpty()) {
+                label(textMeasurer, "%.0f°".format(tMax), style, left = false, y = 0f)
+                label(textMeasurer, "%.0f°".format(tMin), style, left = false, y = size.height, bottom = true)
+            }
+
+            // Fadenkreuz
+            scrubT?.let { t ->
+                val cx = x(nearest.firstNotNullOfOrNull { it }?.first ?: t)
+                drawLine(InkMuted, Offset(cx, 0f), Offset(cx, size.height), strokeWidth = 1.dp.toPx())
+                lines.forEachIndexed { i, l ->
+                    nearest[i]?.let { p -> dot(Offset(x(p.first), if (l.isTemp) yT(p.second) else yP(p.second)), l.color) }
+                }
+            }
+        }
+    }
+}
+
+private fun valueText(l: ChartLine, v: Double) = if (l.isTemp) "%.0f°".format(v) else formatPower(v)
+
+@Composable
+private fun LegendItem(color: Color, text: String, fontSize: TextUnit) {
     Row(verticalAlignment = Alignment.CenterVertically) {
         Box(Modifier.size(7.dp).background(color, CircleShape))
         Spacer(Modifier.width(3.dp))
-        Text(text, fontSize = 11.sp, color = InkPrimary, maxLines = 1)
+        Text(text, fontSize = fontSize, color = InkPrimary, maxLines = 1)
     }
 }
 
@@ -218,4 +277,3 @@ private fun niceCeil(v: Double): Double {
     val nice = listOf(1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0).first { f <= it }
     return nice * base
 }
-

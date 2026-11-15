@@ -1,6 +1,5 @@
 package ch.solarwatch.tile
 
-import androidx.annotation.DrawableRes
 import androidx.wear.protolayout.ActionBuilders
 import androidx.wear.protolayout.ColorBuilders.argb
 import androidx.wear.protolayout.DimensionBuilders.dp
@@ -15,46 +14,27 @@ import androidx.wear.tiles.RequestBuilders
 import androidx.wear.tiles.TileBuilders
 import androidx.wear.tiles.TileService
 import ch.solarwatch.MainActivity
-import ch.solarwatch.R
+import ch.solarwatch.data.AppIcon
+import ch.solarwatch.data.DisplaySettings
+import ch.solarwatch.data.Metric
+import ch.solarwatch.data.MetricView
+import ch.solarwatch.data.Palette
+import ch.solarwatch.data.SettingsStore
 import ch.solarwatch.data.SolarData
 import ch.solarwatch.data.SolarManagerApi
-import ch.solarwatch.data.formatEnergy
-import ch.solarwatch.data.formatPower
+import ch.solarwatch.data.isAvailable
+import ch.solarwatch.data.view
 import com.google.common.util.concurrent.ListenableFuture
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.guava.future
-import java.util.Locale
 
-private const val RESOURCES_VERSION = "2"
-
-// Farben wie in der App
-private const val YELLOW = 0xFFFFC107.toInt()
-private const val BLUE = 0xFF64B5F6.toInt()
-private const val ORANGE = 0xFFFF8A65.toInt()
-private const val RED = 0xFFEF5350.toInt()
-private const val INK = 0xFFEEEEEE.toInt()
-private const val MUTED = 0xFF9E9E9E.toInt()
-
-/** Symbol-IDs -> Drawables */
-private val ICONS: Map<String, Int> = mapOf(
-    "sun" to R.drawable.ic_sunny,
-    "home" to R.drawable.ic_home,
-    "today" to R.drawable.ic_today,
-    "thermo" to R.drawable.ic_device_thermostat,
-    "drop" to R.drawable.ic_water_drop,
-    "fire" to R.drawable.ic_local_fire_department,
-    "shower" to R.drawable.ic_shower,
-    "heatpump" to R.drawable.ic_heat_pump,
-)
+private const val RESOURCES_VERSION = "3"
 
 /**
- * Tile:
- *   ☀ PV jetzt   ⌂ Verbrauch jetzt
- *   📅 Produktion heute
- *   🌡 Aussen   [Zustand WP]   💧 Warmwasser
+ * Kachel mit den in den Einstellungen gewählten Werten (3 Zeilen: 2 / 1 / 3).
  * Tippen öffnet die App.
  */
 class SolarTileService : TileService() {
@@ -64,12 +44,14 @@ class SolarTileService : TileService() {
         requestParams: RequestBuilders.TileRequest,
     ): ListenableFuture<TileBuilders.Tile> = scope.future {
         val data = runCatching { SolarManagerApi.fetchStream() }.getOrNull() ?: SolarManagerApi.lastData
-        val today = runCatching { SolarManagerApi.todayPvWh() }.getOrNull()
+        val settings = SettingsStore.display.value
+        val needsToday = settings.tile.rows.flatten().contains(Metric.TODAY_PV)
+        val today = if (needsToday) runCatching { SolarManagerApi.todayPvWh() }.getOrNull() else null
 
         TileBuilders.Tile.Builder()
             .setResourcesVersion(RESOURCES_VERSION)
             .setFreshnessIntervalMillis(5 * 60 * 1000L)
-            .setTileTimeline(TimelineBuilders.Timeline.fromLayoutElement(layout(data, today)))
+            .setTileTimeline(TimelineBuilders.Timeline.fromLayoutElement(layout(data, today, settings)))
             .build()
     }
 
@@ -77,13 +59,13 @@ class SolarTileService : TileService() {
         requestParams: RequestBuilders.ResourcesRequest,
     ): ListenableFuture<ResourceBuilders.Resources> = scope.future {
         val res = ResourceBuilders.Resources.Builder().setVersion(RESOURCES_VERSION)
-        ICONS.forEach { (id, drawable) ->
+        AppIcon.entries.forEach { icon ->
             res.addIdToImageMapping(
-                id,
+                icon.name,
                 ResourceBuilders.ImageResource.Builder()
                     .setAndroidResourceByResId(
                         ResourceBuilders.AndroidImageResourceByResId.Builder()
-                            .setResourceId(drawable)
+                            .setResourceId(icon.res)
                             .build(),
                     )
                     .build(),
@@ -99,50 +81,29 @@ class SolarTileService : TileService() {
 
     // ------------------------------------------------------------------ layout
 
-    private fun layout(d: SolarData?, todayWh: Double?): LayoutElement {
+    private fun layout(d: SolarData?, todayWh: Double?, settings: DisplaySettings): LayoutElement {
         val column = LayoutElementBuilders.Column.Builder()
             .setHorizontalAlignment(LayoutElementBuilders.HORIZONTAL_ALIGN_CENTER)
 
         if (d == null) {
-            column.addContent(text("Keine Daten", 16f, RED))
+            val msg = if (SolarManagerApi.isConfigured) "Keine Daten" else "API-Zugang fehlt"
+            column.addContent(text(msg, 16f, Palette.HEATING_RED))
         } else {
-            // Jetzt: Produktion + Verbrauch
-            column.addContent(
-                row(
-                    iconValue("sun", YELLOW, formatPower(d.pvW), 20f, bold = true),
-                    spacerW(12f),
-                    iconValue("home", BLUE, formatPower(d.consumptionW), 20f, bold = true),
-                ),
-            )
-            column.addContent(spacerH(6f))
-            // Heute
-            column.addContent(
-                row(
-                    iconValue("today", YELLOW, todayWh?.let { formatEnergy(it) } ?: "–", 16f),
-                    text(" heute", 13f, MUTED),
-                ),
-            )
-            // Wärmepumpe
-            d.heatPump?.let { hp ->
-                column.addContent(spacerH(12f))
-                val (stateIcon, stateColor) = when (hp.operationState) {
-                    2 -> "fire" to RED
-                    3 -> "shower" to ORANGE
-                    else -> "heatpump" to MUTED
+            // Zeile: Schriftgrösse, fett, Abstand davor
+            val styles = listOf(Triple(20f, true, 0f), Triple(16f, false, 6f), Triple(16f, false, 12f))
+            var first = true
+            settings.tile.rows.forEachIndexed { r, slots ->
+                val metrics = slots.filterNotNull().filter { it.isAvailable(d) }
+                if (metrics.isEmpty()) return@forEachIndexed
+                val (size, bold, gap) = styles[r]
+                if (!first) column.addContent(spacerH(gap))
+                first = false
+                val elems = mutableListOf<LayoutElement>()
+                metrics.forEachIndexed { i, m ->
+                    if (i > 0) elems += spacerW(if (metrics.size > 2) 10f else 12f)
+                    elems += metricElement(m.view(d, todayWh, settings), size, bold, m == Metric.HP_STATE)
                 }
-                val stateElems = mutableListOf<LayoutElement>(icon(stateIcon, stateColor, 22f))
-                if (hp.operationState != null && hp.operationState !in setOf(2, 3)) {
-                    stateElems += text("${hp.operationState}", 12f, MUTED)
-                }
-                column.addContent(
-                    row(
-                        iconValue("thermo", INK, temp(hp.outsideTempC), 16f),
-                        spacerW(10f),
-                        *stateElems.toTypedArray(),
-                        spacerW(10f),
-                        iconValue("drop", ORANGE, temp(hp.waterTempC), 16f, bold = true),
-                    ),
-                )
+                column.addContent(row(*elems.toTypedArray()))
             }
         }
 
@@ -170,8 +131,6 @@ class SolarTileService : TileService() {
             .build()
     }
 
-    private fun temp(c: Double?): String = c?.let { String.format(Locale.US, "%.1f°", it) } ?: "–"
-
     private fun row(vararg elems: LayoutElement): LayoutElement {
         val r = LayoutElementBuilders.Row.Builder()
             .setVerticalAlignment(LayoutElementBuilders.VERTICAL_ALIGN_CENTER)
@@ -179,8 +138,15 @@ class SolarTileService : TileService() {
         return r.build()
     }
 
-    private fun iconValue(iconId: String, tint: Int, value: String, size: Float, bold: Boolean = false): LayoutElement =
-        row(icon(iconId, tint, size + 2f), spacerW(3f), text(value, size, INK, bold))
+    private fun metricElement(v: MetricView, size: Float, bold: Boolean, stateIcon: Boolean): LayoutElement {
+        val elems = mutableListOf(icon(v.icon.name, v.tint, size + if (stateIcon) 6f else 2f))
+        if (v.text.isNotEmpty()) {
+            elems += spacerW(3f)
+            elems += text(v.text, size, Palette.INK, bold)
+        }
+        v.suffix?.let { elems += text(it, size - 3f, Palette.MUTED) }
+        return row(*elems.toTypedArray())
+    }
 
     private fun icon(id: String, tint: Int, sizeDp: Float): LayoutElement =
         LayoutElementBuilders.Image.Builder()

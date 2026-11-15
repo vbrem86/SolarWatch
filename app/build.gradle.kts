@@ -54,11 +54,15 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.wear.compose:compose-material:1.4.0")
     implementation("androidx.wear.compose:compose-foundation:1.4.0")
+    implementation("androidx.wear.compose:compose-navigation:1.4.0")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
 
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-guava:1.9.0")
+
+    // Empfang der Zugangsdaten von der Handy-App (Wear OS Data Layer)
+    implementation("com.google.android.gms:play-services-wearable:18.2.0")
 
     // Tile
     implementation("androidx.wear.tiles:tiles:1.4.1")

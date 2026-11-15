@@ -1,5 +1,5 @@
 <resources>
     <string name="app_name">Solar</string>
     <string name="tile_label">Solar Manager</string>
-    <string name="complication_label">Solar PV-Leistung</string>
+    <string name="complication_label">Solar Manager</string>
 </resources>

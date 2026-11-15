@@ -1,6 +1,5 @@
 package ch.solarwatch.data
 
-import ch.solarwatch.BuildConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -22,8 +21,10 @@ object SolarManagerApi {
     private const val BASE = "https://cloud.solar-manager.ch"
     private const val TIMEOUT_MS = 15_000
 
-    private val apiKey = BuildConfig.SM_API_KEY
-    private val smId = BuildConfig.SM_ID
+    private const val NOT_CONFIGURED = "API-Zugang fehlt – über die Handy-App einrichten."
+
+    private val apiKey: String get() = SettingsStore.credentials.value.apiKey
+    private val smId: String get() = SettingsStore.credentials.value.smId
 
     @Volatile var lastData: SolarData? = null
         private set
@@ -34,11 +35,18 @@ object SolarManagerApi {
     /** Zwischenspeicher für [todayPvWh] (Zeitpunkt, Wert) */
     @Volatile private var todayCache: Pair<Long, Double>? = null
 
-    val isConfigured: Boolean get() = apiKey.isNotBlank() && smId.isNotBlank()
+    val isConfigured: Boolean get() = SettingsStore.credentials.value.isConfigured
+
+    /** Nach einem Wechsel der Zugangsdaten: alte Werte verwerfen. */
+    fun resetCache() {
+        lastData = null
+        lastHistory = null
+        todayCache = null
+    }
 
     suspend fun fetchStream(): SolarData = withContext(Dispatchers.IO) {
         if (!isConfigured) {
-            throw SolarManagerException("API-Key / smId fehlen in local.properties")
+            throw SolarManagerException(NOT_CONFIGURED)
         }
         parse(get("/v3/users/$smId/data/stream")).also { lastData = it }
     }
@@ -46,34 +54,39 @@ object SolarManagerApi {
     /**
      * Verlauf der letzten [hours] Stunden in 15-Minuten-Schritten:
      *  - PV & Verbrauch:  GET /v3/users/{smId}/data/range
-     *  - Wassertemperatur: GET /v3/devices/{heatPumpId}/data/range
+     *    (mindestens ab Mitternacht, damit "PV heute" immer stimmt)
+     *  - Wassertemperatur: GET /v3/devices/{heatPumpId}/data/range (nur wenn [includeWater])
      */
-    suspend fun fetchHistory(hours: Long = 24): History = withContext(Dispatchers.IO) {
+    suspend fun fetchHistory(hours: Long = 24, includeWater: Boolean = true): History = withContext(Dispatchers.IO) {
         if (!isConfigured) {
-            throw SolarManagerException("API-Key / smId fehlen in local.properties")
+            throw SolarManagerException(NOT_CONFIGURED)
         }
         val to = java.time.Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS)
         val from = to.minus(java.time.Duration.ofHours(hours))
         val range = "from=$from&to=$to&interval=900"
+        val midnightInstant = java.time.LocalDate.now().atStartOfDay(java.time.ZoneId.systemDefault()).toInstant()
+        val midnight = midnightInstant.toEpochMilli()
+        val mainFrom = minOf(from, midnightInstant)
 
-        val main = get("/v3/users/$smId/data/range?$range").optJSONArray("data")
+        val main = get("/v3/users/$smId/data/range?from=$mainFrom&to=$to&interval=900").optJSONArray("data")
         val pv = ArrayList<Pair<Long, Double>>()
         val cons = ArrayList<Pair<Long, Double>>()
-        val midnight = java.time.LocalDate.now().atStartOfDay(java.time.ZoneId.systemDefault())
-            .toInstant().toEpochMilli()
+        val fromMs = from.toEpochMilli()
         var todayPvWh = 0.0
         if (main != null) {
             for (i in 0 until main.length()) {
                 val o = main.optJSONObject(i) ?: continue
                 val t = parseTime(o) ?: continue
-                o.numOrNull("pW")?.let { pv += t to it }
-                o.numOrNull("cW")?.let { cons += t to it }
+                if (t >= fromMs) {
+                    o.numOrNull("pW")?.let { pv += t to it }
+                    o.numOrNull("cW")?.let { cons += t to it }
+                }
                 // Intervall-Energie; Zeitstempel = Beginn des Intervalls
                 if (t >= midnight) todayPvWh += o.numOrNull("pWh") ?: 0.0
             }
         }
 
-        val hpId = (lastData ?: fetchStream()).heatPump?.id
+        val hpId = if (includeWater) (lastData ?: fetchStream()).heatPump?.id else null
         val water = hpId?.let { id ->
             val arr = get("/v3/devices/$id/data/range?$range").optJSONArray("data")
             val pts = ArrayList<Pair<Long, Double>>()
@@ -104,6 +117,7 @@ object SolarManagerApi {
      */
     suspend fun todayPvWh(): Double = withContext(Dispatchers.IO) {
         todayCache?.let { (at, v) -> if (System.currentTimeMillis() - at < 5 * 60_000) return@withContext v }
+        if (!isConfigured) throw SolarManagerException(NOT_CONFIGURED)
         val from = java.time.LocalDate.now().atStartOfDay(java.time.ZoneId.systemDefault()).toInstant()
         val to = java.time.Instant.now().truncatedTo(java.time.temporal.ChronoUnit.SECONDS)
         val arr = get("/v3/users/$smId/data/range?from=$from&to=$to&interval=900").optJSONArray("data")
@@ -189,7 +203,7 @@ object SolarManagerApi {
                 in 200..299 -> return JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
                 401, 403 -> throw SolarManagerException(
                     "API-Schlüssel ungültig. Neuen Schlüssel (ohne \"Erneuerung erlauben\") " +
-                        "erzeugen und in local.properties eintragen.",
+                        "erzeugen und über die Handy-App senden.",
                 )
                 429 -> throw SolarManagerException("Zu viele Abfragen – bitte später erneut versuchen.")
                 else -> {
