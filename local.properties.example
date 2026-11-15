@@ -1,0 +1,7 @@
+# Kopiere diese Datei nach local.properties (wird NICHT eingecheckt)
+# sdk.dir wird von Android Studio automatisch gesetzt.
+
+# Solar Manager Web-App -> Profil -> Cloud-API-Schlüssel
+solarmanager.apiKey=DEIN_API_KEY
+# Solar Manager ID (smId) deines Gateways, z.B. in der Web-App unter Gateway-Info
+solarmanager.smId=DEINE_SM_ID
